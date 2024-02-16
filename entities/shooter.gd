@@ -1,0 +1,177 @@
+@tool
+class_name Shooter
+extends Node2D
+
+signal has_shot(reload_time: float)
+signal projectile_instanced(type: Projectile)
+signal anim_restarted(anim_name: String)  # используется для синхронизации анимаций
+
+@export var detector_color: Color = Color(1, 0.22, 0.25, 0.25)  # для отладки
+@export var detect_radius: int = 200:
+	set = set_detect_radius
+@export var fire_rate: float = 0.5
+@export var rot_speed: float = 5.0
+@export_enum("Normal", "Homing") var shooting_mode: int
+@export_range(1, 6) var projectile_count: int = 1:
+	set = set_projectile_count
+@export var projectile_type: PackedScene
+@export var projectile_spread: float = 0.2
+@export var projectile_speed: int = 1000
+@export var projectile_damage: int = 10
+
+var is_mouse_hovering := false  # используется для отрисовки радиуса обнаружения, установлен родительской сценой
+var targets: Array[Node2D]
+var can_shoot := true
+var muzzle_idx := -1  # используется в режиме самонаведения, иначе остается отрицательным
+
+@onready var gun := $Gun as AnimatedSprite2D
+@onready var muzzle_flash := $MuzzleFlash as AnimatedSprite2D
+@onready var detector := $Detector as Area2D
+@onready var detector_coll := $Detector/CollisionShape2D as CollisionShape2D
+@onready var detector_shape := CircleShape2D.new()
+@onready var lookahead := $LookAhead as RayCast2D
+@onready var firerate_timer := $FireRateTimer as Timer
+
+
+func _ready() -> void:
+	if shooting_mode == 1:  # Самонаведение
+		muzzle_idx = 0
+	# инициализация формы детектора
+	detector_shape.radius = detect_radius
+	detector_coll.shape = detector_shape
+	# инициализация длины и маски коллизии луча
+	lookahead.target_position.x = detect_radius + 50
+	lookahead.collision_mask = detector.collision_mask
+	# инициализация анимаций
+	_play_animations("idle")
+
+
+func _physics_process(delta: float) -> void:
+	# обновление отрисовки
+	queue_redraw()
+	if not targets.is_empty():
+		# обработка вращения оружия
+		var target_pos: Vector2 = targets.front().global_position
+		var target_rot: float = global_position.direction_to(target_pos).angle()
+		rotation = lerp_angle(rotation, target_rot, rot_speed * delta)
+
+
+func _draw() -> void:
+	draw_circle(Vector2.ZERO, detect_radius if is_mouse_hovering else 0,
+			detector_color)
+
+
+# Вызывается родителями, чтобы иметь больше контроля над моментом выстрела
+func shoot() -> void:
+	can_shoot = false
+	if shooting_mode == 0:  # Обычный
+		for _muzzle in gun.get_children():
+			_instance_projectile(_muzzle.global_position)
+		_play_animations("shoot")
+	else:  # Самонаведение
+		var muzzle_pos := (gun.get_child(muzzle_idx) as Marker2D).global_position
+		_instance_projectile(muzzle_pos, targets.front())
+		muzzle_idx = Global.wrap_index(muzzle_idx + 1, projectile_count)
+		muzzle_flash.global_position = muzzle_pos
+		_play_animations("shoot_%s" % ["b" if muzzle_idx == 0 else "a"])
+	# отображение времени перезарядки на HUD
+	firerate_timer.start(fire_rate)
+	has_shot.emit(firerate_timer.wait_time)
+
+
+func explode() -> void:
+	# остановка обработки и запрет на стрельбу
+	set_physics_process(false)
+	can_shoot = false
+	firerate_timer.stop()
+	# воспроизведение анимации
+	_play_animations("explode")
+
+
+# Может быть вызвано состояниями врага, например, для замораживания времени перезарядки танка
+# при попадании.
+func set_firerate_timer_paused(value: bool) -> void:
+	firerate_timer.paused = value
+
+
+func set_detect_radius(value: int) -> void:
+	detect_radius = value
+	if is_instance_valid(detector_shape):
+		detector_shape.radius = detect_radius
+		lookahead.target_position.x = detect_radius
+
+
+func set_projectile_count(value: int) -> void:
+	projectile_count = value
+	var _gun := get_node("Gun")
+	var diff := value - _gun.get_child_count()
+	match signi(diff):
+		1:
+			for i in diff:
+				var dup = _gun.get_node("Muzzle").duplicate() as Marker2D
+				_gun.add_child(dup, true)
+				dup.owner = self
+		-1:
+			for i in abs(diff):
+				_gun.get_child(-1).queue_free()
+
+
+func _on_fire_rate_timer_timeout() -> void:
+	can_shoot = true
+
+
+func _instance_projectile(_position: Vector2, target=null) -> void:
+	var projectile: Projectile = projectile_type.instantiate()
+	projectile.start(_position,
+			rotation + randf_range(-projectile_spread, projectile_spread),
+			projectile_speed, projectile_damage, target)
+	projectile.collision_mask = detector.collision_mask
+	projectile_instanced.emit(projectile)
+
+
+func _play_animations(anim_name: String) -> void:
+	gun.play(anim_name)
+	muzzle_flash.play(anim_name)
+	anim_restarted.emit(anim_name)
+
+
+func _on_parent_mouse_entered() -> void:
+	is_mouse_hovering = true
+
+
+func _on_parent_mouse_exited() -> void:
+	is_mouse_hovering = false
+
+
+func _on_gun_animation_finished() -> void:
+	if gun.animation.contains("shoot"):
+		_play_animations("idle")
+
+
+# Нам нужна немного другая логика для анимаций с циклами, поскольку мы хотим
+# оставить их циклическими, если у них все еще есть цели
+func _on_gun_animation_looped() -> void:
+	if gun.animation.contains("shoot") and targets.is_empty():
+		_play_animations("idle")
+
+
+# Мы только записываем массив целей, затем каждая родительская сущность
+# позаботится о переключении состояния
+func _on_detector_area_entered(area: Area2D) -> void:
+	if not area in targets:
+		targets.append(area)
+
+
+func _on_detector_area_exited(area: Area2D) -> void:
+	if area in targets:
+		targets.erase(area)
+
+
+func _on_detector_body_entered(body: Node2D) -> void:
+	if not body in targets:
+		targets.append(body)
+
+
+func _on_detector_body_exited(body: Node2D) -> void:
+	if body in targets:
+		targets.erase(body)
